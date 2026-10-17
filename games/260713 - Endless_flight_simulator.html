@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Serene Flight</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;600&family=DM+Sans:wght@300;400&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{overflow:hidden;background:#1a1a1a;font-family:'DM Sans',sans-serif}
+canvas{display:block}
+#start-screen{position:fixed;inset:0;z-index:100;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(10,8,6,0.55);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:opacity 1.8s ease,visibility 1.8s}
+#start-screen.hidden{opacity:0;visibility:hidden;pointer-events:none}
+#start-screen h1{font-family:'Cormorant Garamond',serif;font-weight:300;font-size:clamp(2.4rem,8vw,5rem);color:#f0e6d8;letter-spacing:.18em;text-transform:uppercase;margin-bottom:.4rem}
+#start-screen p{color:#a89880;font-size:.95rem;font-weight:300;letter-spacing:.12em;margin-bottom:3rem}
+#start-screen .cta{color:#d4b896;font-size:.85rem;font-weight:300;letter-spacing:.22em;text-transform:uppercase;animation:pulse 2.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
+#hud{position:fixed;top:0;left:0;right:0;z-index:10;padding:1.8rem 2.2rem;display:flex;justify-content:space-between;align-items:flex-start;pointer-events:none;opacity:0;transition:opacity 1s ease .5s}
+#hud.visible{opacity:1}
+.hud-item{color:rgba(240,230,216,.6);font-size:.72rem;font-weight:300;letter-spacing:.16em;text-transform:uppercase;text-shadow:0 1px 6px rgba(0,0,0,.6)}
+.hud-value{font-family:'Cormorant Garamond',serif;font-size:1.9rem;font-weight:600;color:#f0e6d8;display:block;margin-top:.15rem;text-shadow:0 2px 10px rgba(0,0,0,.6);line-height:1}
+#controls-hint{position:fixed;bottom:1.8rem;left:50%;transform:translateX(-50%);z-index:10;pointer-events:none;color:rgba(168,152,128,.7);font-size:.7rem;font-weight:300;letter-spacing:.14em;text-transform:uppercase;text-shadow:0 1px 6px rgba(0,0,0,.6);opacity:0;transition:opacity 1s ease 1.5s;text-align:center;white-space:nowrap}
+#controls-hint.visible{opacity:1}
+#controls-hint.fade{opacity:0;transition:opacity 2.5s ease}
+#vignette{position:fixed;inset:0;z-index:5;pointer-events:none;background:radial-gradient(ellipse at center,transparent 45%,rgba(10,8,6,.55) 100%)}
+</style>
+</head>
+<body>
+<div id="start-screen">
+  <h1>Serene Flight</h1>
+  <p>A procedural flight experience</p>
+  <span class="cta">Click anywhere to begin</span>
+</div>
+<div id="hud">
+  <div class="hud-item">Altitude<span class="hud-value" id="alt-val">0 ft</span></div>
+  <div class="hud-item" style="text-align:right">Speed<span class="hud-value" id="spd-val">0 kts</span></div>
+</div>
+<div id="controls-hint">Move mouse to steer &middot; Scroll to adjust speed &middot; W / S or arrows for pitch</div>
+<div id="vignette"></div>
+
+<script type="importmap">
+{
+  "imports":{
+    "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ===== NOISE ===== */
+function hash2D(ix, iy) {
+  let h = (ix * 374761393 + iy * 668265263 + 1013904223) | 0;
+  h = ((h ^ (h >>> 13)) * 1274126177) | 0;
+  h = (h ^ (h >>> 16)) | 0;
+  return (h & 0x7fffffff) / 0x7fffffff;
+}
+function smoothNoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const a = hash2D(ix, iy), b = hash2D(ix + 1, iy);
+  const c = hash2D(ix, iy + 1), d = hash2D(ix + 1, iy + 1);
+  return (a * (1 - sx) + b * sx) * (1 - sy) + (c * (1 - sx) + d * sx) * sy;
+}
+function fbm(x, y, oct = 6) {
+  let v = 0, a = .5, f = 1;
+  for (let i = 0; i < oct; i++) { v += a * smoothNoise(x * f, y * f); a *= .5; f *= 2; }
+  return v;
+}
+
+/* ===== TERRAIN ===== */
+const WATER_LEVEL = 12;
+function getHeight(wx, wz) {
+  const s = 0.001;
+  let h = (fbm(wx * s * .5, wz * s * .5, 4) - .5) * 55;
+  let r = fbm(wx * s, wz * s, 5);
+  r = 1 - Math.abs(r * 2 - 1); r *= r;
+  h += r * 95;
+  h += (fbm(wx * s * 4, wz * s * 4, 3) - .5) * 5;
+  return h;
+}
+
+const _c = new THREE.Color();
+const cSand = new THREE.Color(.76, .70, .50);
+const cGrass = new THREE.Color(.32, .52, .22);
+const cDkG = new THREE.Color(.22, .40, .15);
+const cRock = new THREE.Color(.53, .50, .46);
+const cSnow = new THREE.Color(.94, .95, .97);
+function terrainColor(h) {
+  if (h < WATER_LEVEL + 2) return _c.setRGB(.76, .70, .50);
+  if (h < 28) return _c.lerpColors(cSand, cGrass, (h - WATER_LEVEL - 2) / 26);
+  if (h < 52) return _c.lerpColors(cGrass, cDkG, (h - 28) / 24);
+  if (h < 78) return _c.lerpColors(cDkG, cRock, (h - 52) / 26);
+  if (h < 105) return _c.lerpColors(cRock, cSnow, (h - 78) / 27);
+  return _c.copy(cSnow);
+}
+
+/* ===== SCENE ===== */
+const scene = new THREE.Scene();
+const FOG_COL = new THREE.Color(0xc9956b);
+scene.fog = new THREE.FogExp2(FOG_COL, 0.0005);
+scene.background = FOG_COL;
+
+const camera = new THREE.PerspectiveCamera(68, innerWidth / innerHeight, 1, 5000);
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.85;
+document.body.prepend(renderer.domElement);
+
+/* ===== SKY DOME ===== */
+const skyGeo = new THREE.SphereGeometry(2500, 32, 24);
+const skyMat = new THREE.ShaderMaterial({
+  fog: false, side: THREE.BackSide, depthWrite: false,
+  uniforms: {
+    uSunDir: { value: new THREE.Vector3(.45, .18, -.75).normalize() }
+  },
+  vertexShader: `
+    varying vec3 vDir;
+    void main(){
+      vDir = normalize((modelMatrix * vec4(position,1.0)).xyz);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+    }`,
+  fragmentShader: `
+    uniform vec3 uSunDir;
+    varying vec3 vDir;
+    void main(){
+      vec3 d = normalize(vDir);
+      float h = d.y;
+      vec3 top = vec3(.05,.09,.18);
+      vec3 mid = vec3(.24,.38,.58);
+      vec3 hor = vec3(.88,.55,.38);
+      vec3 bot = vec3(.78,.44,.30);
+      vec3 col;
+      if(h > 0.0){
+        float t1 = smoothstep(0.0,.25,h);
+        float t2 = smoothstep(.25,.85,h);
+        col = mix(hor, mid, t1);
+        col = mix(col, top, t2);
+      } else {
+        col = mix(hor, bot, smoothstep(0.0,-.25,h));
+      }
+      float sd = max(dot(d, uSunDir), 0.0);
+      col += vec3(1.,.82,.55) * pow(sd, 6.0) * .45;
+      col += vec3(1.,.96,.85) * pow(sd, 256.0) * 2.5;
+      col += vec3(.9,.6,.35) * pow(sd, 2.0) * .12;
+      gl_FragColor = vec4(col, 1.0);
+    }`
+});
+scene.add(new THREE.Mesh(skyGeo, skyMat));
+
+/* ===== LIGHTS ===== */
+const sunDir = new THREE.Vector3(.45, .18, -.75).normalize();
+const sunLight = new THREE.DirectionalLight(0xffd4a0, 1.6);
+sunLight.position.copy(sunDir.clone().multiplyScalar(800));
+scene.add(sunLight);
+scene.add(new THREE.HemisphereLight(0x6a8fb5, 0x8b7355, 0.35));
+scene.add(new THREE.AmbientLight(0x3a4a5a, 0.25));
+
+/* ===== TERRAIN CHUNKS ===== */
+const CHUNK_SZ = 256, CHUNK_SEG = 64, CHUNK_RNG = 4;
+const chunks = new Map();
+const chunkMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+
+function chunkKey(cx, cz) { return cx + ',' + cz; }
+
+function createChunk(cx, cz) {
+  const geo = new THREE.PlaneGeometry(CHUNK_SZ, CHUNK_SZ, CHUNK_SEG, CHUNK_SEG);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  const cols = new Float32Array(pos.count * 3);
+  const ox = cx * CHUNK_SZ, oz = cz * CHUNK_SZ;
+  for (let i = 0; i < pos.count; i++) {
+    const wx = pos.getX(i) + ox, wz = pos.getZ(i) + oz;
+    const h = getHeight(wx, wz);
+    pos.setY(i, h);
+    terrainColor(h);
+    cols[i * 3] = _c.r; cols[i * 3 + 1] = _c.g; cols[i * 3 + 2] = _c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, chunkMat);
+  mesh.position.set(ox, 0, oz);
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+}
+
+function updateChunks(px, pz) {
+  const cx = Math.round(px / CHUNK_SZ), cz = Math.round(pz / CHUNK_SZ);
+  const needed = new Set();
+  for (let dx = -CHUNK_RNG; dx <= CHUNK_RNG; dx++)
+    for (let dz = -CHUNK_RNG; dz <= CHUNK_RNG; dz++) {
+      const k = chunkKey(cx + dx, cz + dz);
+      needed.add(k);
+      if (!chunks.has(k)) chunks.set(k, createChunk(cx + dx, cz + dz));
+    }
+  for (const [k, m] of chunks) {
+    if (!needed.has(k)) {
+      scene.remove(m); m.geometry.dispose(); chunks.delete(k);
+    }
+  }
+}
+
+/* ===== WATER ===== */
+const waterGeo = new THREE.PlaneGeometry(8000, 8000, 1, 1);
+waterGeo.rotateX(-Math.PI / 2);
+const waterMat = new THREE.MeshPhongMaterial({
+  color: 0x1a6878, specular: 0xffe8c0, shininess: 120,
+  transparent: true, opacity: .78, depthWrite: false
+});
+const water = new THREE.Mesh(waterGeo, waterMat);
+water.position.y = WATER_LEVEL;
+water.renderOrder = 1;
+scene.add(water);
+
+/* ===== CLOUDS ===== */
+const CLOUD_N = 1200;
+const cloudGeo = new THREE.IcosahedronGeometry(1, 2);
+{
+  const p = cloudGeo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const len = Math.max(Math.sqrt(x*x + y*y + z*z), .001);
+    const n = .82 + Math.random() * .36;
+    p.setXYZ(i, x / len * n, y / len * n * .55, z / len * n);
+  }
+  cloudGeo.computeVertexNormals();
+}
+const cloudMat = new THREE.MeshLambertMaterial({
+  color: 0xffe6cc, transparent: true, opacity: .72, depthWrite: false
+});
+const cloudMesh = new THREE.InstancedMesh(cloudGeo, cloudMat, CLOUD_N);
+cloudMesh.renderOrder = 2;
+
+const cPos = [], cScl = [], cDrift = [];
+let ci = 0;
+for (let c = 0; c < 260 && ci < CLOUD_N; c++) {
+  const bx = (Math.random() - .5) * 3200;
+  const by = 125 + Math.random() * 80;
+  const bz = (Math.random() - .5) * 3200;
+  const bs = 14 + Math.random() * 24;
+  const dr = .3 + Math.random() * 1.2;
+  const pn = 3 + Math.floor(Math.random() * 4);
+  for (let j = 0; j < pn && ci < CLOUD_N; j++) {
+    cPos.push(bx + (Math.random() - .5) * bs * 2.2, by + (Math.random() - .5) * bs * .35, bz + (Math.random() - .5) * bs * 2.2);
+    const sx = bs * (.5 + Math.random() * .55), sy = bs * (.14 + Math.random() * .14), sz = bs * (.5 + Math.random() * .55);
+    cScl.push(sx, sy, sz);
+    cDrift.push(dr);
+    ci++;
+  }
+}
+const dummy = new THREE.Object3D();
+for (let i = 0; i < CLOUD_N; i++) {
+  dummy.position.set(cPos[i*3], cPos[i*3+1], cPos[i*3+2]);
+  dummy.scale.set(cScl[i*3], cScl[i*3+1], cScl[i*3+2]);
+  dummy.updateMatrix();
+  cloudMesh.setMatrixAt(i, dummy.matrix);
+  const b = .88 + Math.random() * .12;
+  cloudMesh.setColorAt(i, new THREE.Color(b, b * .97, b * .92));
+}
+cloudMesh.instanceMatrix.needsUpdate = true;
+cloudMesh.instanceColor.needsUpdate = true;
+scene.add(cloudMesh);
+
+function updateClouds(px, pz, dt) {
+  const WRAP = 1600;
+  let dirty = false;
+  for (let i = 0; i < CLOUD_N; i++) {
+    cPos[i*3] += cDrift[i] * dt;
+    let w = false;
+    if (cPos[i*3] - px > WRAP) { cPos[i*3] -= WRAP * 2; w = true; }
+    if (cPos[i*3] - px < -WRAP) { cPos[i*3] += WRAP * 2; w = true; }
+    if (cPos[i*3+2] - pz > WRAP) { cPos[i*3+2] -= WRAP * 2; w = true; }
+    if (cPos[i*3+2] - pz < -WRAP) { cPos[i*3+2] += WRAP * 2; w = true; }
+    if (w) {
+      dummy.position.set(cPos[i*3], cPos[i*3+1], cPos[i*3+2]);
+      dummy.scale.set(cScl[i*3], cScl[i*3+1], cScl[i*3+2]);
+      dummy.updateMatrix();
+      cloudMesh.setMatrixAt(i, dummy.matrix);
+      dirty = true;
+    }
+  }
+  if (dirty) cloudMesh.instanceMatrix.needsUpdate = true;
+}
+
+/* ===== AIRCRAFT ===== */
+const aircraft = new THREE.Group();
+{
+  const bodyM = new THREE.MeshPhongMaterial({ color: 0xe8e0d4, flatShading: true });
+  const accM = new THREE.MeshPhongMaterial({ color: 0xc45c3a, flatShading: true });
+  const darkM = new THREE.MeshPhongMaterial({ color: 0x3a3530, flatShading: true });
+
+  // Fuselage
+  const fuse = new THREE.Mesh(new THREE.CylinderGeometry(.42, .28, 5.2, 8), bodyM);
+  fuse.rotation.x = Math.PI / 2; aircraft.add(fuse);
+  // Nose
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(.42, 1.6, 8), accM);
+  nose.rotation.x = -Math.PI / 2; nose.position.z = -3.4; aircraft.add(nose);
+  // Wings
+  const wing = new THREE.Mesh(new THREE.BoxGeometry(14, .08, 1.7), bodyM);
+  wing.position.set(0, -.05, .3); aircraft.add(wing);
+  // Wing tips
+  [-7.1, 7.1].forEach(x => {
+    const tip = new THREE.Mesh(new THREE.BoxGeometry(.28, .55, .7), accM);
+    tip.position.set(x, .2, .3); aircraft.add(tip);
+  });
+  // H-tail
+  const ht = new THREE.Mesh(new THREE.BoxGeometry(5.2, .06, .9), bodyM);
+  ht.position.set(0, 0, 2.6); aircraft.add(ht);
+  // V-tail
+  const vt = new THREE.Mesh(new THREE.BoxGeometry(.06, 2.1, 1.1), accM);
+  vt.position.set(0, 1.05, 2.4); aircraft.add(vt);
+  // Propeller disc
+  const prop = new THREE.Mesh(new THREE.CircleGeometry(.85, 20), darkM);
+  prop.rotation.x = Math.PI / 2; prop.position.z = -4.2;
+  prop.material = new THREE.MeshBasicMaterial({ color: 0x2a2520, transparent: true, opacity: .7, side: THREE.DoubleSide });
+  aircraft.add(prop);
+  aircraft.userData.prop = prop;
+}
+aircraft.renderOrder = 3;
+scene.add(aircraft);
+
+/* ===== ATMOSPHERE PARTICLES ===== */
+const PART_N = 350;
+const partGeo = new THREE.BufferGeometry();
+const partPos = new Float32Array(PART_N * 3);
+for (let i = 0; i < PART_N; i++) {
+  partPos[i*3] = (Math.random() - .5) * 180;
+  partPos[i*3+1] = Math.random() * 90 - 15;
+  partPos[i*3+2] = (Math.random() - .5) * 180;
+}
+partGeo.setAttribute('position', new THREE.BufferAttribute(partPos, 3));
+const partMat = new THREE.PointsMaterial({
+  color: 0xffeedd, size: .55, transparent: true, opacity: .25,
+  blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true
+});
+const particles = new THREE.Points(partGeo, partMat);
+particles.renderOrder = 4;
+scene.add(particles);
+
+/* ===== FLIGHT STATE ===== */
+const flight = {
+  pos: new THREE.Vector3(0, 130, 0),
+  pitch: 0, yaw: 0, roll: 0,
+  speed: 80, targetSpeed: 80
+};
+let targetPitch = 0, targetRoll = 0;
+let mouseNX = 0, mouseNY = 0;
+const keys = {};
+let gameStarted = false;
+
+/* ===== INPUT ===== */
+document.addEventListener('mousemove', e => {
+  mouseNX = (e.clientX / innerWidth - .5) * 2;
+  mouseNY = (e.clientY / innerHeight - .5) * 2;
+});
+document.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  mouseNX = (t.clientX / innerWidth - .5) * 2;
+  mouseNY = (t.clientY / innerHeight - .5) * 2;
+}, { passive: false });
+document.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+document.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+window.addEventListener('wheel', e => {
+  flight.targetSpeed = THREE.MathUtils.clamp(flight.targetSpeed - e.deltaY * .12, 15, 220);
+}, { passive: true });
+
+/* ===== START SCREEN ===== */
+const startEl = document.getElementById('start-screen');
+const hudEl = document.getElementById('hud');
+const hintEl = document.getElementById('controls-hint');
+let hintTimer = 0;
+
+function startGame() {
+  if (gameStarted) return;
+  gameStarted = true;
+  startEl.classList.add('hidden');
+  hudEl.classList.add('visible');
+  hintEl.classList.add('visible');
+  hintTimer = performance.now();
+}
+startEl.addEventListener('click', startGame);
+startEl.addEventListener('touchstart', startGame, { passive: true });
+
+/* ===== FLIGHT UPDATE ===== */
+const _fwd = new THREE.Vector3();
+const _camOff = new THREE.Vector3();
+const _lookAt = new THREE.Vector3();
+
+function updateFlight(dt, time) {
+  if (!gameStarted) {
+    // Gentle autopilot for the menu backdrop
+    flight.yaw += .025 * dt;
+    flight.pitch = THREE.MathUtils.lerp(flight.pitch, -.04 + Math.sin(time * .0004) * .02, 1.5 * dt);
+    flight.roll = THREE.MathUtils.lerp(flight.roll, Math.sin(time * .0003) * .12, 1.5 * dt);
+  } else {
+    // Compute target inputs from mouse + keyboard
+    let tp = -mouseNY * .9;
+    let tr = -mouseNX * 1.6;
+    if (keys['w'] || keys['arrowup']) tp = -.9;
+    if (keys['s'] || keys['arrowdown']) tp = .9;
+    if (keys['a'] || keys['arrowleft']) tr = 1.6;
+    if (keys['d'] || keys['arrowright']) tr = -1.6;
+    targetPitch = tp;
+    targetRoll = tr;
+
+    flight.roll = THREE.MathUtils.lerp(flight.roll, targetRoll, 2.8 * dt);
+    flight.pitch = THREE.MathUtils.lerp(flight.pitch, targetPitch, 2.8 * dt);
+
+    // Auto-level roll when centered
+    if (Math.abs(targetRoll) < .05) {
+      flight.roll = THREE.MathUtils.lerp(flight.roll, 0, 1.2 * dt);
+    }
+    // Coordinated turn: yaw follows roll
+    flight.yaw += Math.sin(flight.roll) * 1.1 * dt;
+  }
+
+  // Speed
+  flight.speed = THREE.MathUtils.lerp(flight.speed, flight.targetSpeed, 2 * dt);
+
+  // Apply rotation
+  aircraft.rotation.order = 'YXZ';
+  aircraft.rotation.y = flight.yaw;
+  aircraft.rotation.x = flight.pitch;
+  aircraft.rotation.z = flight.roll;
+
+  // Move forward
+  _fwd.set(0, 0, -1).applyEuler(aircraft.rotation);
+  flight.pos.addScaledVector(_fwd, flight.speed * dt);
+
+  // Terrain avoidance
+  const th = getHeight(flight.pos.x, flight.pos.z);
+  const minH = Math.max(th, WATER_LEVEL) + 7;
+  if (flight.pos.y < minH) {
+    flight.pos.y = minH;
+    if (flight.pitch > -.05) flight.pitch = THREE.MathUtils.lerp(flight.pitch, -.15, 5 * dt);
+  }
+  // Ceiling
+  if (flight.pos.y > 350) flight.pos.y = 350;
+
+  aircraft.position.copy(flight.pos);
+
+  // Propeller spin
+  if (aircraft.userData.prop) aircraft.userData.prop.rotation.z += dt * (25 + flight.speed * .3);
+
+  // Camera follow
+  _camOff.set(0, 3.5 + Math.sin(time * .0006) * .3, 14);
+  _camOff.applyEuler(aircraft.rotation);
+  const targetCam = flight.pos.clone().add(_camOff);
+  camera.position.lerp(targetCam, gameStarted ? 4.5 * dt : 2 * dt);
+
+  _lookAt.copy(flight.pos).addScaledVector(_fwd, 35);
+  camera.lookAt(_lookAt);
+}
+
+/* ===== UI ===== */
+const altEl = document.getElementById('alt-val');
+const spdEl = document.getElementById('spd-val');
+function updateHUD() {
+  if (!gameStarted) return;
+  const alt = Math.max(0, flight.pos.y * 3.281);
+  altEl.textContent = Math.round(alt) + ' ft';
+  spdEl.textContent = Math.round(flight.speed * 1.944) + ' kts';
+}
+
+/* ===== PARTICLES FOLLOW ===== */
+function updateParticles() {
+  particles.position.copy(flight.pos);
+  // Gentle drift
+  const pp = partGeo.attributes.position;
+  for (let i = 0; i < PART_N; i++) {
+    let y = pp.getY(i) + .02;
+    if (y > 75) y = -15;
+    pp.setY(i, y);
+  }
+  pp.needsUpdate = true;
+}
+
+/* ===== RESIZE ===== */
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ===== INIT ===== */
+updateChunks(flight.pos.x, flight.pos.z);
+camera.position.set(0, 135, 16);
+camera.lookAt(0, 130, -30);
+
+/* ===== ANIMATE ===== */
+let lastTime = 0;
+function animate(time) {
+  requestAnimationFrame(animate);
+  const dt = Math.min((time - lastTime) / 1000, .05);
+  lastTime = time;
+
+  updateFlight(dt, time);
+  updateChunks(flight.pos.x, flight.pos.z);
+  updateClouds(flight.pos.x, flight.pos.z, dt);
+  updateParticles();
+
+  // Water bob
+  water.position.y = WATER_LEVEL + Math.sin(time * .0005) * .25;
+
+  // Dynamic fog density based on altitude
+  const altF = THREE.MathUtils.clamp(1 - (flight.pos.y - 40) / 200, .6, 1.4);
+  scene.fog.density = 0.0005 * altF;
+
+  // Fade controls hint after 6 seconds
+  if (gameStarted && hintTimer && !hintEl.classList.contains('fade')) {
+    if (time - hintTimer > 6000) hintEl.classList.add('fade');
+  }
+
+  updateHUD();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

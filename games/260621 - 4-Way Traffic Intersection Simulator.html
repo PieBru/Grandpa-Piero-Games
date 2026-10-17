@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>4-Way Intersection Simulator</title>
+<style>
+  body { margin:0; background:#1a1a1a; color:#eee; font-family: system-ui, sans-serif; overflow:hidden; }
+  #wrap { position:relative; width:900px; height:900px; margin:10px auto; }
+  canvas { background:#2b2b2b; display:block; border:1px solid #444; }
+  #ui {
+    position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.7);
+    padding:10px 14px; border-radius:8px; font-size:13px; min-width:230px;
+    border:1px solid #555;
+  }
+  #ui h3 { margin:0 0 8px 0; font-size:14px; color:#8cf; }
+  .row { display:flex; justify-content:space-between; margin:3px 0; }
+  .row span:last-child { color:#ffd; font-family: monospace; }
+  input[type=range] { width:140px; vertical-align:middle; }
+  .lights { display:flex; gap:10px; margin-top:6px; }
+  .lg, .le { padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold; }
+  .lg { background:#224; } .le { background:#442; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="900" height="900"></canvas>
+  <div id="ui">
+    <h3>Intersection Simulator</h3>
+    <div class="row"><span>Sim Time:</span><span id="tTime">00:00 / 20:00</span></div>
+    <div class="row"><span>Speed:</span><span id="tSpeed">1.00x</span></div>
+    <div class="row"><input type="range" id="spd" min="0" max="5" step="0.05" value="1" style="width:100%"></div>
+    <div class="row"><span>Cars on road:</span><span id="tCars">0</span></div>
+    <div class="row"><span>Total spawned:</span><span id="tTotal">0</span></div>
+    <div class="row"><span>Phase:</span><span id="tPhase">N/S GREEN</span></div>
+    <div class="lights">
+      <div class="lg" id="lgNS">N/S: GREEN</div>
+      <div class="le" id="lgEW">E/W: RED</div>
+    </div>
+  </div>
+</div>
+<script>
+(() => {
+  const cvs = document.getElementById('c');
+  const ctx = cvs.getContext('2d');
+  const W = cvs.width, H = cvs.height;
+
+  // Geometry
+  const CX = W/2, CY = H/2;
+  const ROAD_HALF = 100;          // road total width 200
+  const LANE_W = ROAD_HALF;       // one lane per direction
+  // N/S road: x in [350,550]. Southbound (down) lane center x=400. Northbound (up) lane center x=500.
+  // E/W road: y in [350,550]. Westbound (left) lane center y=400. Eastbound (right) lane center y=500.
+  const LANE = {
+    N: { axis:'y', dir:-1, center:500, cross:'x', stopLine:560, lightPos:{x:555, y:575}, housing:'V' },
+    S: { axis:'y', dir:+1, center:400, cross:'x', stopLine:340, lightPos:{x:345, y:325}, housing:'V' },
+    E: { axis:'x', dir:+1, center:500, cross:'y', stopLine:340, lightPos:{x:325, y:555}, housing:'H' },
+    W: { axis:'x', dir:-1, center:400, cross:'y', stopLine:560, lightPos:{x:575, y:345}, housing:'H' },
+  };
+
+  // Traffic light state machine
+  const PHASES = [
+    { ns:'green',  ew:'red',    dur:22 },
+    { ns:'yellow', ew:'red',    dur:4  },
+    { ns:'red',    ew:'green',  dur:22 },
+    { ns:'red',    ew:'yellow', dur:4  },
+  ];
+  let phaseIdx = 0, phaseT = 0;
+  function currentLights() {
+    const p = PHASES[phaseIdx];
+    return { N:p.ns, S:p.ns, E:p.ew, W:p.ew };
+  }
+
+  // Simulation state
+  const SIM = {
+    t: 0,            // sim seconds (0..1200 = 20 min)
+    speed: 1,
+    cars: [],
+    nextId: 1,
+    totalSpawned: 0,
+    spawnAcc: { N:0, S:0, E:0, W:0 },
+  };
+  const SIM_END = 1200;
+
+  // Spawn curve over 20 min: ramp up, peak, ramp down
+  function spawnInterval(dir, t) {
+    // t in [0,1200]. Factor: 1 -> 0.35 -> 1
+    let f;
+    if (t < 300)       f = 1 - (t/300) * 0.65;
+    else if (t < 900)  f = 0.35;
+    else               f = 0.35 + ((t-900)/300) * 0.65;
+    // Base interval per direction: 1.2s at peak, ~3.5s at edges
+    const base = 1.2 + 2.3 * f;
+    // Add per-direction jitter so they don't all sync
+    const jitter = ({N:1.0, S:1.15, E:0.9, W:1.25})[dir];
+    return base * jitter;
+  }
+
+  function spawnCar(dir) {
+    const L = LANE[dir];
+    // Start position: far edge of map along the lane
+    let x, y;
+    if (dir === 'N') { x = L.center; y = H + 30; }
+    if (dir === 'S') { x = L.center; y = -30; }
+    if (dir === 'E') { y = L.center; x = -30; }
+    if (dir === 'W') { y = L.center; x = W + 30; }
+    // Don't spawn if a car is too close to start
+    for (const c of SIM.cars) {
+      if (c.dir !== dir) continue;
+      const d = L.axis === 'y' ? Math.abs(c.y - y) : Math.abs(c.x - x);
+      if (d < 80) return;
+    }
+    SIM.cars.push({
+      id: SIM.nextId++, dir, x, y,
+      speed: 0,
+      maxSpeed: 110 + Math.random()*30, // px/s
+      len: 28, wid: 15,
+      color: `hsl(${Math.floor(Math.random()*360)},60%,55%)`,
+    });
+    SIM.totalSpawned++;
+  }
+
+  // Distance from car front to next car's rear in same lane ahead
+  function gapToCarAhead(car) {
+    const L = LANE[car.dir];
+    let best = Infinity, bestCar = null;
+    for (const c of SIM.cars) {
+      if (c === car || c.dir !== car.dir) continue;
+      let d;
+      if (L.axis === 'y') {
+        if (car.dir === 'N') { if (c.y >= car.y) continue; d = car.y - c.y - car.len; }
+        else                 { if (c.y <= car.y) continue; d = c.y - car.y - car.len; }
+      } else {
+        if (car.dir === 'E') { if (c.x <= car.x) continue; d = c.x - car.x - car.len; }
+        else                 { if (c.x >= car.x) continue; d = car.x - c.x - car.len; }
+      }
+      if (d < best) { best = d; bestCar = c; }
+    }
+    return { gap: best, car: bestCar };
+  }
+
+  function distToStopLine(car) {
+    const L = LANE[car.dir];
+    if (L.axis === 'y') {
+      return car.dir === 'N' ? (car.y - L.stopLine) : (L.stopLine - car.y);
+    } else {
+      return car.dir === 'E' ? (L.stopLine - car.x) : (car.x - L.stopLine);
+    }
+  }
+
+  function updateCar(car, dt) {
+    const L = LANE[car.dir];
+    const lights = currentLights();
+    const light = lights[car.dir];
+
+    // Desired speed
+    let target = car.maxSpeed;
+
+    // Car-following (simple safe-gap model)
+    const { gap, car: ahead } = gapToCarAhead(car);
+    if (gap < 140) {
+      // Linear approach; stop at gap=5
+      const followSpeed = car.maxSpeed * Math.max(0, (gap - 5) / 135);
+      // Also match leader speed if close
+      if (ahead && gap < 60) {
+        target = Math.min(target, followSpeed, ahead.speed);
+      } else {
+        target = Math.min(target, followSpeed);
+      }
+    }
+
+    // Red / yellow light stopping
+    if (light !== 'green') {
+      const dStop = distToStopLine(car);
+      if (dStop > -2 && dStop < 120) {
+        // Brake smoothly to stop at line (with small buffer)
+        const brakeStart = 90;
+        if (dStop < brakeStart) {
+          const s = car.maxSpeed * Math.max(0, (dStop - 2) / (brakeStart - 2));
+          target = Math.min(target, s);
+        }
+      }
+    }
+
+    // Integrate speed (asymmetric accel/brake)
+    if (car.speed < target) {
+      car.speed = Math.min(target, car.speed + 70 * dt);
+    } else {
+      car.speed = Math.max(0, car.speed - 180 * dt);
+    }
+
+    // Move
+    if (L.axis === 'y') car.y += L.dir * car.speed * dt;
+    else                car.x += L.dir * car.speed * dt;
+  }
+
+  function step(dt) {
+    // Advance sim time
+    SIM.t += dt;
+    if (SIM.t > SIM_END) SIM.t = SIM_END;
+
+    // Phase machine
+    phaseT += dt;
+    if (phaseT >= PHASES[phaseIdx].dur) {
+      phaseT = 0;
+      phaseIdx = (phaseIdx + 1) % PHASES.length;
+    }
+
+    // Spawn
+    for (const dir of ['N','S','E','W']) {
+      SIM.spawnAcc[dir] += dt;
+      const interval = spawnInterval(dir, SIM.t);
+      while (SIM.spawnAcc[dir] >= interval) {
+        SIM.spawnAcc[dir] -= interval;
+        spawnCar(dir);
+      }
+    }
+
+    // Update cars
+    for (const c of SIM.cars) updateCar(c, dt);
+
+    // Remove off-screen
+    SIM.cars = SIM.cars.filter(c =>
+      c.x > -60 && c.x < W+60 && c.y > -60 && c.y < H+60
+    );
+  }
+
+  // ---------- Rendering ----------
+  function drawRoads() {
+    // Grass background already via canvas bg
+    // Roads
+    ctx.fillStyle = '#3a3a3a';
+    ctx.fillRect(CX - ROAD_HALF, 0, ROAD_HALF*2, H);   // N/S
+    ctx.fillRect(0, CY - ROAD_HALF, W, ROAD_HALF*2);   // E/W
+
+    // Lane dividers (dashed)
+    ctx.strokeStyle = '#f1c40f';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([14, 12]);
+    // N/S center divider - only outside intersection
+    ctx.beginPath();
+    ctx.moveTo(CX, 0); ctx.lineTo(CX, CY - ROAD_HALF);
+    ctx.moveTo(CX, CY + ROAD_HALF); ctx.lineTo(CX, H);
+    ctx.stroke();
+    // E/W
+    ctx.beginPath();
+    ctx.moveTo(0, CY); ctx.lineTo(CX - ROAD_HALF, CY);
+    ctx.moveTo(CX + ROAD_HALF, CY); ctx.lineTo(W, CY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Edge lines
+    ctx.strokeStyle = '#ddd';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(CX - ROAD_HALF, 0, ROAD_HALF*2, H);
+    ctx.strokeRect(0, CY - ROAD_HALF, W, ROAD_HALF*2);
+
+    // Stop lines (white)
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 4;
+    // Northbound stop: horizontal line at y=560 across east lane (x 450..550)
+    ctx.beginPath();
+    ctx.moveTo(450, 560); ctx.lineTo(550, 560); // N
+    ctx.moveTo(350, 340); ctx.lineTo(450, 340); // S
+    ctx.moveTo(340, 450); ctx.lineTo(340, 550); // E
+    ctx.moveTo(560, 350); ctx.lineTo(560, 450); // W
+    ctx.stroke();
+
+    // Intersection box highlight
+    ctx.fillStyle = 'rgba(80,80,80,0.5)';
+    ctx.fillRect(CX - ROAD_HALF, CY - ROAD_HALF, ROAD_HALF*2, ROAD_HALF*2);
+  }
+
+  function drawLight(pos, housing, color) {
+    // housing 'V' = vertical (for N/S traffic), 'H' = horizontal (for E/W)
+    const size = 22;
+    const bulb = 6;
+    ctx.save();
+    // Post
+    ctx.fillStyle = '#222';
+    if (housing === 'V') {
+      ctx.fillRect(pos.x - size/2, pos.y - size*1.4, size, size*2.8);
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+      ctx.strokeRect(pos.x - size/2, pos.y - size*1.4, size, size*2.8);
+      // bulbs stacked vertically: red top, yellow mid, green bottom
+      const colors = { red:'#551111', yellow:'#554411', green:'#115511' };
+      const active = { red:'#ff2222', yellow:'#ffcc22', green:'#22ff44' };
+      const ys = [pos.y - size*0.9, pos.y, pos.y + size*0.9];
+      const names = ['red','yellow','green'];
+      for (let i=0;i<3;i++) {
+        ctx.beginPath();
+        ctx.arc(pos.x, ys[i], bulb, 0, Math.PI*2);
+        ctx.fillStyle = (color === names[i]) ? active[names[i]] : colors[names[i]];
+        ctx.fill();
+        if (color === names[i]) {
+          ctx.shadowColor = active[names[i]]; ctx.shadowBlur = 12;
+          ctx.fill(); ctx.shadowBlur = 0;
+        }
+      }
+    } else {
+      ctx.fillRect(pos.x - size*1.4, pos.y - size/2, size*2.8, size);
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+      ctx.strokeRect(pos.x - size*1.4, pos.y - size/2, size*2.8, size);
+      const colors = { red:'#551111', yellow:'#554411', green:'#115511' };
+      const active = { red:'#ff2222', yellow:'#ffcc22', green:'#22ff44' };
+      const xs = [pos.x - size*0.9, pos.x, pos.x + size*0.9];
+      const names = ['red','yellow','green'];
+      for (let i=0;i<3;i++) {
+        ctx.beginPath();
+        ctx.arc(xs[i], pos.y, bulb, 0, Math.PI*2);
+        ctx.fillStyle = (color === names[i]) ? active[names[i]] : colors[names[i]];
+        ctx.fill();
+        if (color === names[i]) {
+          ctx.shadowColor = active[names[i]]; ctx.shadowBlur = 12;
+          ctx.fill(); ctx.shadowBlur = 0;
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawLights() {
+    const L = currentLights();
+    drawLight(LANE.N.lightPos, 'V', L.N);
+    drawLight(LANE.S.lightPos, 'V', L.S);
+    drawLight(LANE.E.lightPos, 'H', L.E);
+    drawLight(LANE.W.lightPos, 'H', L.W);
+  }
+
+  function drawCar(c) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    let rot = 0;
+    if (c.dir === 'N') rot = -Math.PI/2;
+    if (c.dir === 'S') rot =  Math.PI/2;
+    if (c.dir === 'E') rot = 0;
+    if (c.dir === 'W') rot = Math.PI;
+    ctx.rotate(rot);
+    // body
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.len/2, -c.wid/2, c.len, c.wid);
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+    ctx.strokeRect(-c.len/2, -c.wid/2, c.len, c.wid);
+    // windshield
+    ctx.fillStyle = 'rgba(120,180,220,0.7)';
+    ctx.fillRect(c.len/2 - 9, -c.wid/2 + 2, 6, c.wid - 4);
+    // headlights
+    ctx.fillStyle = '#ffe';
+    ctx.fillRect(c.len/2 - 1, -c.wid/2 + 1, 2, 3);
+    ctx.fillRect(c.len/2 - 1,  c.wid/2 - 4, 2, 3);
+    // taillights
+    ctx.fillStyle = '#a00';
+    ctx.fillRect(-c.len/2 - 1, -c.wid/2 + 1, 2, 3);
+    ctx.fillRect(-c.len/2 - 1,  c.wid/2 - 4, 2, 3);
+    ctx.restore();
+  }
+
+  function drawCars() {
+    for (const c of SIM.cars) drawCar(c);
+  }
+
+  function render() {
+    ctx.fillStyle = '#2b2b2b';
+    ctx.fillRect(0,0,W,H);
+    drawRoads();
+    drawCars();
+    drawLights();
+  }
+
+  // UI
+  const elTime = document.getElementById('tTime');
+  const elSpeed = document.getElementById('tSpeed');
+  const elCars = document.getElementById('tCars');
+  const elTotal = document.getElementById('tTotal');
+  const elPhase = document.getElementById('tPhase');
+  const lgNS = document.getElementById('lgNS');
+  const lgEW = document.getElementById('lgEW');
+  const spd = document.getElementById('spd');
+  spd.addEventListener('input', () => {
+    SIM.speed = parseFloat(spd.value);
+  });
+
+  function fmtTime(s) {
+    const m = Math.floor(s/60), ss = Math.floor(s%60);
+    return `${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+  }
+
+  function updateUI() {
+    elTime.textContent = `${fmtTime(SIM.t)} / 20:00`;
+    elSpeed.textContent = SIM.speed.toFixed(2) + 'x';
+    elCars.textContent = SIM.cars.length;
+    elTotal.textContent = SIM.totalSpawned;
+    const L = currentLights();
+    const nsLabel = `${fmtTime(PHASES[phaseIdx].dur - phaseT)} ${L.N.toUpperCase()}`;
+    const ewLabel = `${fmtTime(PHASES[phaseIdx].dur - phaseT)} ${L.E.toUpperCase()}`;
+    elPhase.textContent = `N/S ${L.N.toUpperCase()} / E/W ${L.E.toUpperCase()}`;
+    lgNS.textContent = 'N/S: ' + L.N.toUpperCase();
+    lgEW.textContent = 'E/W: ' + L.E.toUpperCase();
+    lgNS.style.background = L.N === 'green' ? '#145' : L.N === 'yellow' ? '#553' : '#511';
+    lgEW.style.background = L.E === 'green' ? '#145' : L.E === 'yellow' ? '#553' : '#511';
+  }
+
+  // Main loop
+  let last = performance.now();
+  function loop(now) {
+    const realDt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    const dt = realDt * SIM.speed;
+    if (SIM.t < SIM_END) step(dt);
+    render();
+    updateUI();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
